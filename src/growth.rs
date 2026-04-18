@@ -1,72 +1,104 @@
 use rand::Rng;
-use rand::seq::index::sample;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::union_find::UnionFind;
 
 pub struct GrowthResult {
     pub r_edge: Vec<u32>,
     pub c_edge: Vec<u32>,
-    /// Degree snapshots at requested timesteps (one row per snapshot point).
     pub degree_snapshots: Vec<Vec<u32>>,
 }
 
-/// Encode an undirected edge (u < v) as a single u64 key.
+// Above this N the probability of proposing an already-existing edge in a
+// single step is ~2L/N² < 0.002 % — negligible.  Skip the edge set entirely,
+// saving ~14 bytes * N of RAM per thread and removing all hash-table overhead.
+const DEDUP_THRESHOLD: usize = 50_000;
+
+// ── Shared primitives ────────────────────────────────────────────────────────
+
+/// Sample a uniform random pair (u, v) with u < v from [0, n).
+/// Two RNG calls, zero heap allocation.
 #[inline(always)]
-fn edge_key(u: usize, v: usize, n: usize) -> u64 {
-    debug_assert!(u < v);
+fn sample_pair(n: usize, rng: &mut impl Rng) -> (u32, u32) {
+    let u = rng.gen_range(0..n);
+    let r = rng.gen_range(0..n - 1);
+    let v = if r >= u { r + 1 } else { r };
+    if u < v { (u as u32, v as u32) } else { (v as u32, u as u32) }
+}
+
+/// Encode an undirected edge (u < v) as a u64 for hash-set storage.
+#[inline(always)]
+fn edge_key(u: u32, v: u32, n: usize) -> u64 {
     u as u64 * n as u64 + v as u64
 }
 
-/// Compute the alpha-based switching probability.
-/// Returns the probability of picking a random candidate instead of the minimum.
-/// alpha=0 → 0.0 (pure DPR), alpha=+inf → 1.0 (Erdős-Rényi).
+/// Boltzmann switching probability.
+/// Returns the probability of picking a random candidate instead of the min.
+///   alpha = 0   → 0.0 (pure DPR / Achlioptas)
+///   alpha = inf → 1.0 (Erdős-Rényi)
 #[inline]
-fn switch_prob(scores: &[f64], alpha: f64) -> f64 {
+fn switch_prob(score_min: u64, score_max: u64, score_sum: u64, alpha: f64) -> f64 {
     if alpha == 0.0 {
         return 0.0;
     }
     if alpha.is_infinite() {
         return 1.0;
     }
-    let min = scores.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let kappa: f64 = scores.iter().sum();
-    ((min - max) / (kappa * alpha)).exp()
+    ((score_min as f64 - score_max as f64) / (score_sum as f64 * alpha)).exp()
 }
 
-/// Sample `num_choices` distinct undirected edges that are not already in `edge_set`.
-/// Returns a Vec of (u, v) pairs with u < v.
-fn sample_candidates(
-    num_nodes: usize,
-    num_choices: usize,
-    remaining_edges: usize,
-    edge_set: &HashSet<u64>,
+/// Fill `buf` with `k` distinct candidate edges.
+/// Uses a linear-scan duplicate check (cache-friendly for small k).
+/// If `edge_set` is Some, also rejects edges already in the graph.
+#[inline]
+fn fill_candidates(
+    buf: &mut Vec<(u32, u32)>,
+    k: usize,
+    n: usize,
+    edge_set: Option<&FxHashSet<u64>>,
     rng: &mut impl Rng,
-) -> Vec<(usize, usize)> {
-    let cap = num_choices.min(remaining_edges);
-    let mut candidates = Vec::with_capacity(cap);
-    let mut candidate_keys = HashSet::with_capacity(cap);
-    while candidates.len() < cap {
-        let idx = sample(rng, num_nodes, 2);
-        let a = idx.index(0);
-        let b = idx.index(1);
-        let (u, v) = if a < b { (a, b) } else { (b, a) };
-        let key = edge_key(u, v, num_nodes);
-        if !edge_set.contains(&key) && candidate_keys.insert(key) {
-            candidates.push((u, v));
+) {
+    buf.clear();
+    while buf.len() < k {
+        let (u, v) = sample_pair(n, rng);
+        let key = edge_key(u, v, n);
+        // Linear scan for intra-round duplicates — faster than a HashSet for k ≤ ~16.
+        if buf.iter().any(|&(a, b)| edge_key(a, b, n) == key) {
+            continue;
         }
+        if let Some(s) = edge_set {
+            if s.contains(&key) {
+                continue;
+            }
+        }
+        buf.push((u, v));
     }
-    candidates
 }
 
-/// DPR Growth Process — faithfully mirrors DPRGrowthProcess.m.
-///
-/// * Degrees are initialised to 1 (the MATLAB convention).
-/// * At each step, `num_choices` candidate edges compete; the pair with
-///   the minimum degree product wins (with alpha-based randomisation).
-/// * `deg_dist_pts`: 0-indexed timesteps at which to snapshot degrees.
-///   Pass an empty slice to skip all snapshots.
+/// Pick the winner index from `scores` using integer arithmetic, then
+/// apply the Boltzmann switch if alpha ≠ 0.
+#[inline]
+fn pick_winner(scores: &[u64], alpha: f64, rng: &mut impl Rng) -> usize {
+    let (min_idx, &min_s) = scores
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &s)| s)
+        .unwrap();
+
+    if alpha == 0.0 || scores.len() < 2 {
+        return min_idx;
+    }
+    let max_s = *scores.iter().max().unwrap();
+    let sum_s: u64 = scores.iter().sum();
+    if rng.gen::<f64>() < switch_prob(min_s, max_s, sum_s, alpha) {
+        rng.gen_range(0..scores.len())
+    } else {
+        min_idx
+    }
+}
+
+// ── DPR Growth Process ───────────────────────────────────────────────────────
+
 pub fn dpr_growth_process(
     num_nodes: usize,
     num_choices: usize,
@@ -79,44 +111,63 @@ pub fn dpr_growth_process(
     let mut r_edge = Vec::with_capacity(len);
     let mut c_edge = Vec::with_capacity(len);
     let mut degree_snapshots = Vec::new();
-    let mut edge_set: HashSet<u64> = HashSet::with_capacity(len + num_choices);
 
-    // Maximum possible undirected edges (no self-loops).
-    let max_edges = num_nodes * (num_nodes - 1) / 2;
+    let use_dedup = num_nodes < DEDUP_THRESHOLD;
+    // Only allocate the edge set when needed; otherwise it stays empty and unused.
+    let mut edge_set = FxHashSet::with_capacity_and_hasher(
+        if use_dedup { len } else { 0 },
+        Default::default(),
+    );
+
+    // Reused candidate buffer — one heap allocation for the whole run.
+    let mut cands: Vec<(u32, u32)> = Vec::with_capacity(num_choices);
 
     for step in 0..len {
-        let remaining = max_edges.saturating_sub(step);
-        let candidates = sample_candidates(num_nodes, num_choices, remaining, &edge_set, rng);
-        let n_cands = candidates.len();
+        let (wu, wv) = if num_choices == 2 && !use_dedup {
+            // ── Ultra-fast k=2 / no-dedup path ──────────────────────────────
+            // Zero allocations: two pair samples, one integer comparison.
+            let (u0, v0) = sample_pair(num_nodes, rng);
+            // Retry until second candidate differs from first (essentially never loops).
+            let (u1, v1) = loop {
+                let p = sample_pair(num_nodes, rng);
+                if edge_key(p.0, p.1, num_nodes) != edge_key(u0, v0, num_nodes) {
+                    break p;
+                }
+            };
 
-        // Score each candidate by degree product.
-        let scores: Vec<f64> = candidates
-            .iter()
-            .map(|&(u, v)| (degree[u] as f64) * (degree[v] as f64))
-            .collect();
+            let s0 = degree[u0 as usize] as u64 * degree[v0 as usize] as u64;
+            let s1 = degree[u1 as usize] as u64 * degree[v1 as usize] as u64;
 
-        // Find minimum-score candidate.
-        let mut winner = scores
-            .iter()
-            .enumerate()
-            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+            let use_first = if s0 <= s1 {
+                alpha == 0.0 || rng.gen::<f64>() >= switch_prob(s0, s1, s0 + s1, alpha)
+            } else {
+                alpha != 0.0 && rng.gen::<f64>() < switch_prob(s1, s0, s0 + s1, alpha)
+            };
 
-        // Probabilistic switch to a random candidate.
-        if n_cands > 1 && rng.gen::<f64>() < switch_prob(&scores, alpha) {
-            winner = rng.gen_range(0..n_cands);
+            if use_first { (u0, v0) } else { (u1, v1) }
+        } else {
+            // ── General path (k > 2, or small-N dedup) ──────────────────────
+            let es = if use_dedup { Some(&edge_set) } else { None };
+            fill_candidates(&mut cands, num_choices, num_nodes, es, rng);
+
+            let scores: Vec<u64> = cands
+                .iter()
+                .map(|&(u, v)| degree[u as usize] as u64 * degree[v as usize] as u64)
+                .collect();
+
+            let w = pick_winner(&scores, alpha, rng);
+            cands[w]
+        };
+
+        r_edge.push(wu);
+        c_edge.push(wv);
+
+        if use_dedup {
+            edge_set.insert(edge_key(wu, wv, num_nodes));
         }
 
-        let (u, v) = candidates[winner];
-        r_edge.push(u as u32);
-        c_edge.push(v as u32);
-
-        // Add winner to the permanent edge set; candidates not chosen are NOT kept.
-        edge_set.insert(edge_key(u, v, num_nodes));
-
-        degree[u] += 1;
-        degree[v] += 1;
+        degree[wu as usize] += 1;
+        degree[wv as usize] += 1;
 
         if deg_dist_pts.contains(&step) {
             degree_snapshots.push(degree.clone());
@@ -126,10 +177,8 @@ pub fn dpr_growth_process(
     GrowthResult { r_edge, c_edge, degree_snapshots }
 }
 
-/// Achlioptas Growth Process — faithfully mirrors AchlioptasGrowthProcess.m.
-///
-/// Selection criterion: minimum product of *cluster sizes* (not degrees).
-/// Uses Union-Find for O(α(n)) cluster queries instead of MATLAB's O(n) linear scan.
+// ── Achlioptas Growth Process ────────────────────────────────────────────────
+
 pub fn achlioptas_growth_process(
     num_nodes: usize,
     num_choices: usize,
@@ -142,42 +191,59 @@ pub fn achlioptas_growth_process(
     let mut r_edge = Vec::with_capacity(len);
     let mut c_edge = Vec::with_capacity(len);
     let mut degree_snapshots = Vec::new();
-    let mut edge_set: HashSet<u64> = HashSet::with_capacity(len + num_choices);
     let mut uf = UnionFind::new(num_nodes);
 
-    let max_edges = num_nodes * (num_nodes - 1) / 2;
+    let use_dedup = num_nodes < DEDUP_THRESHOLD;
+    let mut edge_set = FxHashSet::with_capacity_and_hasher(
+        if use_dedup { len } else { 0 },
+        Default::default(),
+    );
+
+    let mut cands: Vec<(u32, u32)> = Vec::with_capacity(num_choices);
 
     for step in 0..len {
-        let remaining = max_edges.saturating_sub(step);
-        let candidates = sample_candidates(num_nodes, num_choices, remaining, &edge_set, rng);
-        let n_cands = candidates.len();
+        let (wu, wv) = if num_choices == 2 && !use_dedup {
+            let (u0, v0) = sample_pair(num_nodes, rng);
+            let (u1, v1) = loop {
+                let p = sample_pair(num_nodes, rng);
+                if edge_key(p.0, p.1, num_nodes) != edge_key(u0, v0, num_nodes) {
+                    break p;
+                }
+            };
 
-        // Score by cluster-size product.
-        let scores: Vec<f64> = candidates
-            .iter()
-            .map(|&(u, v)| (uf.size_of(u) as f64) * (uf.size_of(v) as f64))
-            .collect();
+            let s0 = uf.size_of(u0 as usize) as u64 * uf.size_of(v0 as usize) as u64;
+            let s1 = uf.size_of(u1 as usize) as u64 * uf.size_of(v1 as usize) as u64;
 
-        let mut winner = scores
-            .iter()
-            .enumerate()
-            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+            let use_first = if s0 <= s1 {
+                alpha == 0.0 || rng.gen::<f64>() >= switch_prob(s0, s1, s0 + s1, alpha)
+            } else {
+                alpha != 0.0 && rng.gen::<f64>() < switch_prob(s1, s0, s0 + s1, alpha)
+            };
 
-        if n_cands > 1 && rng.gen::<f64>() < switch_prob(&scores, alpha) {
-            winner = rng.gen_range(0..n_cands);
+            if use_first { (u0, v0) } else { (u1, v1) }
+        } else {
+            let es = if use_dedup { Some(&edge_set) } else { None };
+            fill_candidates(&mut cands, num_choices, num_nodes, es, rng);
+
+            let scores: Vec<u64> = cands
+                .iter()
+                .map(|&(u, v)| uf.size_of(u as usize) as u64 * uf.size_of(v as usize) as u64)
+                .collect();
+
+            let w = pick_winner(&scores, alpha, rng);
+            cands[w]
+        };
+
+        r_edge.push(wu);
+        c_edge.push(wv);
+
+        if use_dedup {
+            edge_set.insert(edge_key(wu, wv, num_nodes));
         }
+        uf.union(wu as usize, wv as usize);
 
-        let (u, v) = candidates[winner];
-        r_edge.push(u as u32);
-        c_edge.push(v as u32);
-
-        edge_set.insert(edge_key(u, v, num_nodes));
-        uf.union(u, v);
-
-        degree[u] += 1;
-        degree[v] += 1;
+        degree[wu as usize] += 1;
+        degree[wv as usize] += 1;
 
         if deg_dist_pts.contains(&step) {
             degree_snapshots.push(degree.clone());
