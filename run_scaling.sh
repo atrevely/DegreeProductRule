@@ -4,11 +4,15 @@
 #
 # N sweeps from 100 to 1e8 with one point per order of magnitude and one
 # halfway between each (i.e. at multiples of sqrt(10) ~ 3.162).
+#
+# Rayon thread count is automatically capped at large N to stay within
+# available RAM (~30 bytes * N * threads).
 
 BINARY="${1:-./target/release/dpr}"
 MEAN_CRIT=0.763
 PROCESS=dpr
 ALPHA=0.0
+TOTAL_CPUS=$(nproc)
 
 # Log-spaced N: every order of magnitude and halfway between (sqrt(10) steps)
 N_VALUES=(
@@ -32,13 +36,30 @@ runs_for_n() {
     fi
 }
 
+# Cap Rayon threads to keep peak RAM within ~75% of available memory.
+# Each thread needs ~30 bytes * N; available RAM is read from /proc/meminfo.
+threads_for_n() {
+    local n=$1
+    local ram_bytes
+    ram_bytes=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo)
+    local mem_per_thread=$(( n * 30 ))
+    local max_threads=$(( ram_bytes * 3 / 4 / mem_per_thread ))
+    # Clamp between 1 and total CPU count
+    if   [ "$max_threads" -lt 1 ];              then echo 1
+    elif [ "$max_threads" -gt "$TOTAL_CPUS" ];  then echo "$TOTAL_CPUS"
+    else                                             echo "$max_threads"
+    fi
+}
+
 OUTPUT=scaling.csv
-echo "N,num_runs,S,C_over_N,C_over_N_std,time_per_run_s" > "$OUTPUT"
+echo "N,num_runs,threads,S,C_over_N,C_over_N_std,time_per_run_s" > "$OUTPUT"
+echo "Detected $TOTAL_CPUS CPUs"
 echo "Writing results to $OUTPUT"
 echo "---"
 
 for N in "${N_VALUES[@]}"; do
     NUM_RUNS=$(runs_for_n "$N")
+    NUM_THREADS=$(threads_for_n "$N")
 
     # Window: 0.6*N to 0.9*N, bracketing the critical point at 0.763*N
     S_POINT=$(echo "$N * 6 / 10" | bc)
@@ -47,11 +68,11 @@ for N in "${N_VALUES[@]}"; do
 
     TMPFILE=$(mktemp /tmp/pm_${N}_XXXX.csv)
 
-    echo -n "N=$N (runs=$NUM_RUNS) ... "
+    echo -n "N=$N (runs=$NUM_RUNS, threads=$NUM_THREADS) ... "
 
     T_START=$(date +%s%N)
 
-    $BINARY perc-max \
+    RAYON_NUM_THREADS=$NUM_THREADS $BINARY perc-max \
         -N "$N" -k 2 \
         --s-point-f "$S_POINT" --e-point-f "$E_POINT" \
         --s-point-b "$S_POINT" --e-point-b "$E_POINT" \
@@ -61,13 +82,12 @@ for N in "${N_VALUES[@]}"; do
         -o "$TMPFILE" 2>/dev/null
 
     T_END=$(date +%s%N)
-    # Wall time in seconds, divided by NUM_RUNS for per-simulation time
     TIME_PER_RUN=$(awk "BEGIN {printf \"%.4f\", ($T_END - $T_START) / 1e9 / $NUM_RUNS}")
 
     NROWS=$(tail -n +2 "$TMPFILE" | wc -l)
     if [ "$NROWS" -lt 2 ]; then
         echo "ERROR: simulation produced $NROWS row(s), skipping"
-        echo "$N,$NUM_RUNS,ERROR,ERROR,ERROR,ERROR" >> "$OUTPUT"
+        echo "$N,$NUM_RUNS,$NUM_THREADS,ERROR,ERROR,ERROR,ERROR" >> "$OUTPUT"
         rm -f "$TMPFILE"
         continue
     fi
@@ -95,7 +115,7 @@ for N in "${N_VALUES[@]}"; do
     CN_STD=$(echo $STATS  | awk '{print $3}')
 
     echo "S(raw)=$S_MEAN  C/N=$CN_MEAN +/- $CN_STD  time/run=${TIME_PER_RUN}s"
-    echo "$N,$NUM_RUNS,$S_MEAN,$CN_MEAN,$CN_STD,$TIME_PER_RUN" >> "$OUTPUT"
+    echo "$N,$NUM_RUNS,$NUM_THREADS,$S_MEAN,$CN_MEAN,$CN_STD,$TIME_PER_RUN" >> "$OUTPUT"
 
     rm -f "$TMPFILE"
 done
