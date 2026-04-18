@@ -13,6 +13,7 @@ N_VALUES=(500 1000 2000 5000 10000 20000)
 
 OUTPUT=scaling.csv
 echo "N,S,S_std,C_over_N,C_over_N_std" > "$OUTPUT"
+# Note: S is expressed as raw node count (fraction * N)
 echo "Writing results to $OUTPUT"
 echo "---"
 
@@ -38,10 +39,10 @@ for N in "${N_VALUES[@]}"; do
     # jump_forward (col 2) is the ensemble mean S — same on every data row
     # jump_std would need re-adding to CSV; compute from per-run data instead.
     # max_clust_mean_fld (col 6) is per-run — average + std across runs.
-    STATS=$(awk -F',' '
+    STATS=$(awk -F',' -v N="$N" '
         NR == 1 { next }   # skip header
         {
-            s    = $2 + 0
+            s    = $2 * N   # multiply fraction by N for raw node count
             cn   = $6 + 0
             sum_cn  += cn
             sum_cn2 += cn * cn
@@ -59,7 +60,7 @@ for N in "${N_VALUES[@]}"; do
     CN_MEAN=$(echo $STATS | awk '{print $3}')
     CN_STD=$(echo $STATS  | awk '{print $4}')
 
-    echo "S=$S_MEAN  C/N=$CN_MEAN"
+    echo "S(raw)=$S_MEAN  C/N=$CN_MEAN"
     echo "$N,$S_MEAN,$S_STD,$CN_MEAN,$CN_STD" >> "$OUTPUT"
 
     rm -f "$TMPFILE"
