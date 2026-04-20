@@ -8,7 +8,8 @@
 # Rayon thread count is automatically capped at large N to stay within
 # available RAM (~30 bytes * N * threads).
 
-BINARY="${1:-./target/release/dpr}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BINARY="${1:-$SCRIPT_DIR/target/release/dpr}"
 MEAN_CRIT=0.763
 PROCESS=dpr
 ALPHA=0.0

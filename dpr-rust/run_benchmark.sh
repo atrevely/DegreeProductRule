@@ -9,7 +9,8 @@
 # Example:
 #   ./run_benchmark.sh ./target/release/dpr
 
-BINARY="${1:-./target/release/dpr}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BINARY="${1:-$SCRIPT_DIR/target/release/dpr}"
 TOTAL_CPUS=$(nproc)
 MEAN_CRIT=0.763
 
@@ -88,14 +89,14 @@ for N in "${N_VALUES[@]}"; do
     TOTAL_EDGES=$(( RUNS_PER_N * LEN * 2 ))
     EDGES_PER_S=$(awk "BEGIN {printf \"%.2f\", $TOTAL_EDGES / $TIME_TOTAL_S / 1e6}")
 
-    # Rough memory per thread: degree array (4B * N) + edge arrays (8B * LEN)
-    # + union-find (9B * N) + edge set if N < 50000 (14B * LEN).
+    # Rough memory per thread: degree (4B*N) + edge arrays (8B*LEN)
+    # + union-find (9B*N) + FxHashSet edge dedup (~14B*LEN, always on).
     MEM_MB=$(awk -v n="$N" -v l="$LEN" 'BEGIN {
-        uf   = 9 * n
-        deg  = 4 * n
-        edge = 8 * l
-        dedup = (n < 50000) ? 14 * l : 0
-        printf "%.1f", (uf + deg + edge + dedup) / 1048576
+        deg   = 4  * n
+        uf    = 9  * n
+        edges = 8  * l
+        dedup = 14 * l
+        printf "%.1f", (deg + uf + edges + dedup) / 1048576
     }')
 
     printf "%-12s  %-8s  %-14s  %-18s  %-18s\n" \
